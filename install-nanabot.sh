@@ -1,583 +1,858 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
-# nanabot v2.0 - Oyster Republic Edge Agent
-# 一键安装脚本 for Android (Termux) / Linux
-# 
-# 使用方法:
-#   curl -fsSL https://nanabot.oyster.ai/install.sh | bash
-#   或本地运行: bash install-nanabot.sh
+# NanaBot (nanabot) - Oyster Edge Agent
+# One-shot installer for Android (Termux) / Linux / macOS.
+#
+# Goals (borrowed from BotDrop patterns):
+# - Single source of truth installer
+# - Idempotent, safe re-runs
+# - Structured output lines for GUI parsing (NANABOT_STEP / NANABOT_ERROR / NANABOT_COMPLETE)
+# - Minimal dependencies (Python venv + websockets)
+#
+# Usage:
+#   bash install-nanabot.sh            # install/update in ~/nanabot
+#   bash install-nanabot.sh uninstall  # uninstall ~/nanabot
+#
+# Optional env (non-interactive preinstall):
+#   NANABOT_GATEWAY_URL=wss://...      # default: wss://gateway.oyster.ai/ws
+#   NANABOT_AUTH_TOKEN=...             # default: null (must set before start)
+#   NANABOT_ENABLED=1                  # default: 0
+#   NANABOT_DEVICE_NAME=...            # default: nanabot-<hostname>
 #
 
-set -e
+set -euo pipefail
+umask 077
 
-# 颜色配置
-RED='\033[0;31m'
+SCRIPT_NAME="install-nanabot.sh"
+
+# -----------------------
+# Output helpers (safe for GUI parsing)
+# -----------------------
+BLUE='\033[0;34m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+RED='\033[0;31m'
+NC='\033[0m'
 
-# 配置
+log_info()    { echo -e "${BLUE}[INFO]${NC} $*"; }
+log_ok()      { echo -e "${GREEN}[OK]${NC} $*"; }
+log_warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
+log_error()   { echo -e "${RED}[ERROR]${NC} $*"; }
+
+# Structured lines (stable)
+step_start()  { echo "NANABOT_STEP:$1:START:$2"; }
+step_done()   { echo "NANABOT_STEP:$1:DONE"; }
+emit_error()  { echo "NANABOT_ERROR:$*"; }
+emit_done()   { echo "NANABOT_COMPLETE"; }
+
+die() {
+  emit_error "$*"
+  log_error "$*"
+  exit 1
+}
+
+on_err() {
+  local exit_code=$?
+  local line_no=${1:-}
+  emit_error "failed at line ${line_no} (exit ${exit_code})"
+  exit "${exit_code}"
+}
+trap 'on_err $LINENO' ERR
+
+# -----------------------
+# Paths / defaults
+# -----------------------
 INSTALL_DIR="${HOME}/nanabot"
 VENV_DIR="${INSTALL_DIR}/venv"
+BIN_DIR="${INSTALL_DIR}/bin"
 CONFIG_DIR="${INSTALL_DIR}/config"
 LOGS_DIR="${INSTALL_DIR}/logs"
-SERVICE_NAME="nanabot"
-GITHUB_RAW="https://raw.githubusercontent.com/oysterrepublic/nanabot/main"
+RUN_DIR="${INSTALL_DIR}/run"
+MARKER_FILE="${INSTALL_DIR}/.nanabot_installed"
 
-# 打印函数
-print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
-print_success() { echo -e "${GREEN}[OK]${NC} $1"; }
-print_warning() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+DEFAULT_GATEWAY_URL="wss://gateway.oyster.ai/ws"
 
-# 检查是否在 Termux 环境
+NANABOT_GATEWAY_URL="${NANABOT_GATEWAY_URL:-$DEFAULT_GATEWAY_URL}"
+NANABOT_AUTH_TOKEN="${NANABOT_AUTH_TOKEN:-}"
+NANABOT_ENABLED="${NANABOT_ENABLED:-0}"
+NANABOT_DEVICE_NAME="${NANABOT_DEVICE_NAME:-nanabot-$(hostname 2>/dev/null | cut -d. -f1 || echo unknown)}"
+
+# Installer log (best-effort). Avoid failing if tee/process-substitution isn't available.
+INSTALL_LOGFILE="${HOME}/nanabot-install.log"
+if command -v tee >/dev/null 2>&1; then
+  # shellcheck disable=SC2094
+  exec > >(tee -a "${INSTALL_LOGFILE}") 2>&1 || true
+fi
+
+# -----------------------
+# Environment detection
+# -----------------------
 is_termux() {
-    [ -n "$TERMUX_VERSION" ] || [ -d "/data/data/com.termux" ]
+  # TERMUX_VERSION is not always exported; this path check is stable.
+  [ -d "/data/data/com.termux" ] || [ -n "${TERMUX_VERSION:-}" ]
 }
 
-# 检查依赖
-check_dependencies() {
-    print_info "检查依赖..."
-    
-    local deps_missing=()
-    
-    if ! command -v python3 &> /dev/null; then
-        deps_missing+=("python3")
-    fi
-    
-    if ! command -v pip3 &> /dev/null && ! command -v pip &> /dev/null; then
-        deps_missing+=("pip")
-    fi
-    
-    if ! command -v git &> /dev/null; then
-        deps_missing+=("git")
-    fi
-    
-    if [ ${#deps_missing[@]} -ne 0 ]; then
-        print_error "缺少依赖: ${deps_missing[*]}"
-        
-        if is_termux; then
-            print_info "在 Termux 中安装依赖..."
-            pkg update -y
-            pkg install -y python git openssl
-        else
-            print_error "请手动安装缺少的依赖"
-            exit 1
-        fi
-    fi
-    
-    print_success "依赖检查通过"
+python_bin() {
+  if command -v python3 >/dev/null 2>&1; then
+    echo "python3"
+  elif command -v python >/dev/null 2>&1; then
+    echo "python"
+  else
+    echo ""
+  fi
 }
 
-# 创建目录结构
-setup_directories() {
-    print_info "创建目录结构..."
-    
-    mkdir -p "${INSTALL_DIR}"/{bin,config,logs,lib}
-    mkdir -p "${CONFIG_DIR}"
-    mkdir -p "${LOGS_DIR}"
-    
-    print_success "目录创建完成: ${INSTALL_DIR}"
-}
+# -----------------------
+# Install helpers
+# -----------------------
+ensure_deps() {
+  step_start 0 "Checking dependencies"
 
-# 创建虚拟环境
-setup_venv() {
-    print_info "创建 Python 虚拟环境..."
-    
-    if [ -d "${VENV_DIR}" ]; then
-        print_warning "虚拟环境已存在，跳过创建"
-        return
+  local py
+  py="$(python_bin)"
+  if [ -z "$py" ]; then
+    if is_termux; then
+      log_info "Termux detected; installing python + openssl + ca-certificates..."
+      pkg update -y
+      pkg install -y python openssl ca-certificates coreutils
+      py="$(python_bin)"
     fi
-    
-    python3 -m venv "${VENV_DIR}"
-    
-    # 激活虚拟环境并安装依赖
-    source "${VENV_DIR}/bin/activate"
-    
-    print_info "升级 pip..."
-    pip install --upgrade pip
-    
-    print_info "安装依赖包..."
-    pip install websockets aiohttp requests
-    
-    deactivate
-    print_success "虚拟环境创建完成"
-}
+  fi
+  [ -n "$py" ] || die "python not found (install python3)"
 
-# 生成设备ID
-generate_device_id() {
-    if command -v openssl &> /dev/null; then
-        openssl rand -hex 16
+  # Ensure venv module exists (some distros split it out)
+  if ! "$py" -c 'import venv' >/dev/null 2>&1; then
+    if is_termux; then
+      die "python venv module missing in Termux python (unexpected)."
     else
-        cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "nanabot-$(date +%s)-$$"
+      die "python venv module missing. Install your distro package: python3-venv"
     fi
+  fi
+
+  # Git is optional (only for future update workflows); keep soft dependency.
+  if ! command -v git >/dev/null 2>&1; then
+    if is_termux; then
+      log_info "Installing git (Termux)..."
+      pkg install -y git
+    else
+      log_warn "git not found (optional)."
+    fi
+  fi
+
+  step_done 0
 }
 
-# 创建主程序
-create_main_program() {
-    print_info "创建 nanabot 主程序..."
-    
-    local device_id=$(generate_device_id)
-    
-    cat > "${INSTALL_DIR}/bin/nanabot.py" << 'PYTHON_EOF'
+setup_dirs() {
+  step_start 1 "Creating directories"
+  mkdir -p "${BIN_DIR}" "${CONFIG_DIR}" "${LOGS_DIR}" "${RUN_DIR}"
+  step_done 1
+}
+
+setup_venv() {
+  step_start 2 "Setting up Python venv"
+
+  if [ ! -d "${VENV_DIR}" ]; then
+    local py
+    py="$(python_bin)"
+    "$py" -m venv "${VENV_DIR}"
+  fi
+
+  # Ensure minimal deps exist (fast no-op if already installed).
+  "${VENV_DIR}/bin/python" -m pip install --upgrade pip >/dev/null
+  if ! "${VENV_DIR}/bin/python" -c 'import websockets' >/dev/null 2>&1; then
+    "${VENV_DIR}/bin/python" -m pip install --no-cache-dir websockets >/dev/null
+  fi
+
+  step_done 2
+}
+
+write_nanabot_py() {
+  step_start 3 "Writing nanabot.py"
+
+  cat > "${BIN_DIR}/nanabot.py" <<'PY'
 #!/usr/bin/env python3
 """
-nanabot v2.0 - Oyster Republic Edge Agent
-轻量级边缘计算节点，连接 Oyster Gateway
+nanabot - Oyster Edge Agent (minimal, installer-embedded)
+
+Features:
+- Termux/Android + Linux support
+- WebSocket connects to gateway
+- Periodic metrics (battery/cpu/memory) + on-demand commands
+- Start/stop managed by nanabot manager script (pidfile)
 """
 
 import asyncio
 import json
 import logging
 import os
+import signal
+import subprocess
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, Optional
 
-import aiohttp
 import websockets
 
-# 配置
+
 INSTALL_DIR = Path.home() / "nanabot"
 CONFIG_FILE = INSTALL_DIR / "config" / "nanabot.json"
 LOGS_DIR = INSTALL_DIR / "logs"
 
-# 日志配置
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(LOGS_DIR / "nanabot.log"),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger("nanabot")
+
+def _now_iso() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
-class Nanabot:
-    """Oyster Republic Edge Agent"""
-    
-    def __init__(self):
-        self.config = self.load_config()
-        self.device_id = self.config.get("device_id", str(uuid.uuid4()))
-        self.gateway_url = self.config.get("gateway_url", "wss://gateway.oyster.ai/ws")
-        self.enabled = self.config.get("enabled", False)
-        self.reconnect_delay = 5
-        self.max_reconnect_delay = 300
-        self.ws = None
-        self.running = False
-        
-    def load_config(self):
-        """加载配置"""
-        if CONFIG_FILE.exists():
-            with open(CONFIG_FILE, 'r') as f:
-                return json.load(f)
-        return self.create_default_config()
-    
-    def create_default_config(self):
-        """创建默认配置"""
-        config = {
-            "device_id": str(uuid.uuid4()),
-            "device_name": f"nanabot-{os.uname().nodename}",
-            "gateway_url": "wss://gateway.oyster.ai/ws",
-            "enabled": False,
-            "heartbeat_interval": 30,
-            "capabilities": {
-                "sensors": ["battery", "cpu", "memory", "network"],
-                "actions": ["execute", "notify", "collect"]
-            },
-            "auth_token": None
-        }
-        self.save_config(config)
-        return config
-    
-    def save_config(self, config):
-        """保存配置"""
-        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump(config, f, indent=2)
-    
-    async def collect_metrics(self):
-        """收集设备指标"""
-        metrics = {
-            "timestamp": datetime.utcnow().isoformat(),
-            "device_id": self.device_id,
-            "type": "metrics"
-        }
-        
-        # 尝试获取电池信息 (Termux/Android)
-        try:
-            if Path("/sys/class/power_supply/battery/capacity").exists():
-                with open("/sys/class/power_supply/battery/capacity", 'r') as f:
-                    metrics["battery"] = int(f.read().strip())
-        except:
-            pass
-        
-        # 获取系统负载
-        try:
-            with open("/proc/loadavg", 'r') as f:
-                load = f.read().strip().split()
-                metrics["cpu_load"] = float(load[0])
-        except:
-            pass
-        
-        # 获取内存信息
-        try:
-            with open("/proc/meminfo", 'r') as f:
-                meminfo = f.read()
-                for line in meminfo.split('\n'):
-                    if 'MemTotal' in line:
-                        metrics["memory_total"] = int(line.split()[1])
-                    elif 'MemAvailable' in line:
-                        metrics["memory_available"] = int(line.split()[1])
-        except:
-            pass
-        
-        return metrics
-    
-    async def handle_command(self, message):
-        """处理来自 Gateway 的命令"""
-        try:
-            cmd = json.loads(message)
-            cmd_type = cmd.get("type")
-            
-            logger.info(f"收到命令: {cmd_type}")
-            
-            if cmd_type == "ping":
-                return {"type": "pong", "timestamp": datetime.utcnow().isoformat()}
-            
-            elif cmd_type == "execute":
-                # 执行 shell 命令
-                import subprocess
-                command = cmd.get("command", "")
-                try:
-                    result = subprocess.run(
-                        command, 
-                        shell=True, 
-                        capture_output=True, 
-                        text=True, 
-                        timeout=30
-                    )
-                    return {
-                        "type": "execute_result",
-                        "stdout": result.stdout,
-                        "stderr": result.stderr,
-                        "returncode": result.returncode
-                    }
-                except subprocess.TimeoutExpired:
-                    return {"type": "error", "message": "Command timeout"}
-            
-            elif cmd_type == "get_metrics":
-                return await self.collect_metrics()
-            
-            elif cmd_type == "update_config":
-                # 更新配置
-                new_config = cmd.get("config", {})
-                self.config.update(new_config)
-                self.save_config(self.config)
-                return {"type": "config_updated", "config": self.config}
-            
-            else:
-                return {"type": "error", "message": f"Unknown command: {cmd_type}"}
-                
-        except json.JSONDecodeError:
-            return {"type": "error", "message": "Invalid JSON"}
-        except Exception as e:
-            logger.error(f"处理命令错误: {e}")
-            return {"type": "error", "message": str(e)}
-    
-    async def connect(self):
-        """连接 Gateway"""
-        if not self.enabled:
-            logger.warning("nanabot 未启用，请在配置中设置 enabled: true")
-            return False
-        
-        try:
-            logger.info(f"连接 Gateway: {self.gateway_url}")
-            
-            headers = {
-                "X-Device-ID": self.device_id,
-                "X-Device-Name": self.config.get("device_name", "unknown")
-            }
-            
-            if self.config.get("auth_token"):
-                headers["Authorization"] = f"Bearer {self.config['auth_token']}"
-            
-            self.ws = await websockets.connect(
-                self.gateway_url,
-                extra_headers=headers,
-                ping_interval=20,
-                ping_timeout=10
-            )
-            
-            # 发送注册信息
-            await self.ws.send(json.dumps({
-                "type": "register",
-                "device_id": self.device_id,
-                "device_name": self.config.get("device_name"),
-                "capabilities": self.config.get("capabilities", {}),
-                "timestamp": datetime.utcnow().isoformat()
-            }))
-            
-            logger.info("连接成功")
-            self.reconnect_delay = 5  # 重置重连延迟
-            return True
-            
-        except Exception as e:
-            logger.error(f"连接失败: {e}")
-            return False
-    
-    async def run(self):
-        """主循环"""
-        self.running = True
-        logger.info("nanabot 启动...")
-        
-        while self.running:
-            try:
-                if await self.connect():
-                    async for message in self.ws:
-                        try:
-                            response = await self.handle_command(message)
-                            if response:
-                                await self.ws.send(json.dumps(response))
-                        except Exception as e:
-                            logger.error(f"处理消息错误: {e}")
-                
-                # 断开连接，等待重连
-                if self.running:
-                    logger.info(f"{self.reconnect_delay}秒后重连...")
-                    await asyncio.sleep(self.reconnect_delay)
-                    self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
-                    
-            except Exception as e:
-                logger.error(f"连接错误: {e}")
-                await asyncio.sleep(self.reconnect_delay)
-    
-    def stop(self):
-        """停止服务"""
-        logger.info("nanabot 停止...")
-        self.running = False
-
-
-def main():
-    """入口函数"""
-    import signal
-    
-    bot = Nanabot()
-    
-    def signal_handler(sig, frame):
-        print('\n收到停止信号...')
-        bot.stop()
-        sys.exit(0)
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
+def _read_text(path: Path) -> Optional[str]:
     try:
-        asyncio.run(bot.run())
+        return path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+
+
+def _write_json(path: Path, data: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=False), encoding="utf-8")
+
+
+def _load_config() -> Dict[str, Any]:
+    if CONFIG_FILE.exists():
+        try:
+            return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    # Default config if missing/corrupt.
+    cfg = {
+        "device_id": uuid.uuid4().hex[:16],
+        "device_name": f"nanabot-{os.uname().nodename if hasattr(os, 'uname') else 'device'}",
+        "gateway_url": "wss://gateway.oyster.ai/ws",
+        "enabled": False,
+        "metrics_interval": 30,
+        "auth_token": None,
+        "capabilities": {
+            "metrics": True,
+            "execute": True,
+        },
+    }
+    _write_json(CONFIG_FILE, cfg)
+    return cfg
+
+
+def _setup_logging(level: str = "INFO") -> logging.Logger:
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+    logger = logging.getLogger("nanabot")
+    logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+
+    fh = logging.FileHandler(LOGS_DIR / "nanabot.log")
+    fh.setFormatter(fmt)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+
+    logger.handlers.clear()
+    logger.addHandler(fh)
+    logger.addHandler(sh)
+
+    return logger
+
+
+def _collect_metrics(device_id: str) -> Dict[str, Any]:
+    metrics: Dict[str, Any] = {
+        "type": "metrics",
+        "device_id": device_id,
+        "timestamp": _now_iso(),
+        "battery": None,
+        "cpu_load_1m": None,
+        "memory_kb": {},
+    }
+
+    # Battery (best-effort): sysfs; falls back to null.
+    try:
+        cap = Path("/sys/class/power_supply/battery/capacity")
+        if cap.exists():
+            metrics["battery"] = int(_read_text(cap) or "0")
+    except Exception:
+        pass
+
+    # CPU load avg
+    try:
+        with open("/proc/loadavg", "r", encoding="utf-8") as f:
+            metrics["cpu_load_1m"] = float(f.read().strip().split()[0])
+    except Exception:
+        pass
+
+    # Memory (kB)
+    try:
+        mem_total = None
+        mem_avail = None
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    mem_total = int(line.split()[1])
+                elif line.startswith("MemAvailable:"):
+                    mem_avail = int(line.split()[1])
+        if mem_total is not None:
+            metrics["memory_kb"]["total"] = mem_total
+        if mem_avail is not None:
+            metrics["memory_kb"]["available"] = mem_avail
+    except Exception:
+        pass
+
+    return metrics
+
+
+@dataclass
+class _Conn:
+    ws: Any
+    cfg: Dict[str, Any]
+    logger: logging.Logger
+
+
+async def _handle_message(conn: _Conn, raw: str) -> Optional[Dict[str, Any]]:
+    try:
+        msg = json.loads(raw)
+    except Exception:
+        return {"type": "error", "message": "invalid_json"}
+
+    t = msg.get("type")
+    if t == "ping":
+        return {"type": "pong", "timestamp": _now_iso()}
+
+    if t == "get_metrics":
+        return _collect_metrics(conn.cfg["device_id"])
+
+    if t == "execute":
+        if not conn.cfg.get("capabilities", {}).get("execute", True):
+            return {"type": "error", "message": "execute_disabled"}
+
+        command = msg.get("command", "")
+        if not isinstance(command, str) or not command.strip():
+            return {"type": "error", "message": "empty_command"}
+
+        try:
+            r = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            return {
+                "type": "execute_result",
+                "command": command,
+                "stdout": r.stdout,
+                "stderr": r.stderr,
+                "returncode": r.returncode,
+            }
+        except subprocess.TimeoutExpired:
+            return {"type": "error", "message": "command_timeout"}
+
+    if t == "update_config":
+        new_cfg = msg.get("config", {})
+        if isinstance(new_cfg, dict):
+            conn.cfg.update(new_cfg)
+            _write_json(CONFIG_FILE, conn.cfg)
+            return {"type": "config_updated", "timestamp": _now_iso()}
+        return {"type": "error", "message": "invalid_config"}
+
+    return {"type": "error", "message": f"unknown_type:{t}"}
+
+
+async def _metrics_loop(conn: _Conn) -> None:
+    interval = int(conn.cfg.get("metrics_interval") or 30)
+    interval = max(10, min(interval, 3600))
+
+    if not conn.cfg.get("capabilities", {}).get("metrics", True):
+        return
+
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await conn.ws.send(json.dumps(_collect_metrics(conn.cfg["device_id"])))
+        except Exception as e:
+            conn.logger.warning(f"metrics_send_failed: {e}")
+            raise
+
+
+async def _run_once(cfg: Dict[str, Any], logger: logging.Logger) -> None:
+    if not cfg.get("enabled", False):
+        logger.warning("nanabot disabled (set enabled=true in config)")
+        raise SystemExit(2)
+
+    url = cfg.get("gateway_url") or "wss://gateway.oyster.ai/ws"
+    token = cfg.get("auth_token")
+
+    headers = {
+        "X-Device-ID": cfg["device_id"],
+        "X-Device-Name": cfg.get("device_name") or f"nanabot-{cfg['device_id']}",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    logger.info(f"connecting: {url}")
+
+    async with websockets.connect(
+        url,
+        extra_headers=headers,
+        ping_interval=20,
+        ping_timeout=10,
+        close_timeout=5,
+    ) as ws:
+        conn = _Conn(ws=ws, cfg=cfg, logger=logger)
+
+        # Register (best-effort; gateway may ignore)
+        try:
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "register",
+                        "device_id": cfg["device_id"],
+                        "device_name": cfg.get("device_name"),
+                        "capabilities": cfg.get("capabilities", {}),
+                        "timestamp": _now_iso(),
+                    }
+                )
+            )
+        except Exception:
+            pass
+
+        metrics_task = asyncio.create_task(_metrics_loop(conn))
+        try:
+            async for raw in ws:
+                resp = await _handle_message(conn, raw)
+                if resp is not None:
+                    await ws.send(json.dumps(resp))
+            # If the server closes the connection cleanly, avoid a tight reconnect loop.
+            raise RuntimeError("connection_closed")
+        finally:
+            metrics_task.cancel()
+
+
+async def main_async() -> None:
+    cfg = _load_config()
+    logger = _setup_logging(cfg.get("log_level", "INFO"))
+
+    # Ensure required keys exist.
+    cfg.setdefault("device_id", uuid.uuid4().hex[:16])
+    cfg.setdefault("device_name", f"nanabot-{cfg['device_id']}")
+    _write_json(CONFIG_FILE, cfg)
+
+    delay = 5
+    max_delay = 300
+
+    while True:
+        try:
+            await _run_once(cfg, logger)
+        except SystemExit:
+            raise
+        except Exception as e:
+            logger.error(f"run_error: {e}")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, max_delay)
+
+
+def main() -> None:
+    def _signal_handler(_sig, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    try:
+        asyncio.run(main_async())
     except KeyboardInterrupt:
-        print('\n用户中断')
-    except Exception as e:
-        logger.error(f"运行错误: {e}")
-        sys.exit(1)
+        pass
 
 
 if __name__ == "__main__":
     main()
-PYTHON_EOF
+PY
 
-    chmod +x "${INSTALL_DIR}/bin/nanabot.py"
-    print_success "主程序创建完成"
+  chmod +x "${BIN_DIR}/nanabot.py"
+  step_done 3
 }
 
-# 创建配置文件
-create_config() {
-    print_info "创建配置文件..."
-    
-    local device_id=$(generate_device_id)
-    
-    cat > "${CONFIG_DIR}/nanabot.json" << EOF
+write_config() {
+  step_start 4 "Writing config"
+
+  mkdir -p "${CONFIG_DIR}"
+
+  # Create config only if missing (do not clobber user edits).
+  if [ ! -f "${CONFIG_DIR}/nanabot.json" ]; then
+    NANABOT_ENABLED="${NANABOT_ENABLED}" \
+    NANABOT_AUTH_TOKEN="${NANABOT_AUTH_TOKEN}" \
+    NANABOT_DEVICE_NAME="${NANABOT_DEVICE_NAME}" \
+    NANABOT_GATEWAY_URL="${NANABOT_GATEWAY_URL}" \
+    "${VENV_DIR}/bin/python" - "${CONFIG_DIR}/nanabot.json" <<'PY'
+import json, os, sys, uuid
+
+path = sys.argv[1]
+
+enabled_raw = (os.getenv("NANABOT_ENABLED") or "").strip().lower()
+enabled = enabled_raw in ("1", "true", "yes", "on")
+
+token = os.getenv("NANABOT_AUTH_TOKEN") or None
+if token == "":
+    token = None
+
+cfg = {
+    "device_id": uuid.uuid4().hex[:16],
+    "device_name": os.getenv("NANABOT_DEVICE_NAME") or "nanabot-device",
+    "gateway_url": os.getenv("NANABOT_GATEWAY_URL") or "wss://gateway.oyster.ai/ws",
+    "enabled": enabled,
+    "metrics_interval": 30,
+    "auth_token": token,
+    "capabilities": {
+        "metrics": True,
+        "execute": True,
+    },
+}
+
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PY
+  fi
+
+  # Always keep an example template around.
+  if [ ! -f "${CONFIG_DIR}/nanabot.json.example" ]; then
+    cat > "${CONFIG_DIR}/nanabot.json.example" <<'EOF'
 {
-  "device_id": "${device_id}",
-  "device_name": "nanabot-$(hostname | cut -d. -f1)",
+  "device_id": "auto",
+  "device_name": "nanabot-my-phone",
   "gateway_url": "wss://gateway.oyster.ai/ws",
   "enabled": false,
-  "heartbeat_interval": 30,
+  "metrics_interval": 30,
+  "auth_token": "PASTE_TOKEN_HERE",
   "capabilities": {
-    "sensors": ["battery", "cpu", "memory", "network"],
-    "actions": ["execute", "notify", "collect"]
-  },
-  "auth_token": null
+    "metrics": true,
+    "execute": true
+  }
 }
 EOF
+  fi
 
-    print_success "配置创建完成"
-    print_info "设备ID: ${device_id}"
+  step_done 4
 }
 
-# 创建启动脚本
-create_launcher_scripts() {
-    print_info "创建启动脚本..."
-    
-    # 主启动脚本
-    cat > "${INSTALL_DIR}/bin/nanabot-start" << 'EOF'
-#!/bin/bash
-INSTALL_DIR="${HOME}/nanabot"
-VENV_DIR="${INSTALL_DIR}/venv"
+write_manager() {
+  step_start 5 "Writing manager command"
 
-if [ ! -d "${VENV_DIR}" ]; then
-    echo "错误: 虚拟环境不存在，请重新安装"
-    exit 1
-fi
+  cat > "${BIN_DIR}/nanabot" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
 
-source "${VENV_DIR}/bin/activate"
+NANABOT_DIR="${HOME}/nanabot"
+VENV_PY="${NANABOT_DIR}/venv/bin/python"
+BOT_PY="${NANABOT_DIR}/bin/nanabot.py"
+CFG="${NANABOT_DIR}/config/nanabot.json"
+PID_FILE="${NANABOT_DIR}/run/nanabot.pid"
+LOG_OUT="${NANABOT_DIR}/logs/nanabot.out"
+LOG_MAIN="${NANABOT_DIR}/logs/nanabot.log"
 
-# 检查是否已在运行
-if pgrep -f "nanabot.py" > /dev/null; then
-    echo "nanobot 已经在运行"
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+info() { echo -e "${BLUE}[INFO]${NC} $*"; }
+ok()   { echo -e "${GREEN}[OK]${NC} $*"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+err()  { echo -e "${RED}[ERROR]${NC} $*"; }
+
+usage() {
+  cat <<USAGE
+nanabot manager
+
+Usage:
+  nanabot start
+  nanabot stop
+  nanabot restart
+  nanabot status
+  nanabot logs
+  nanabot config
+  nanabot uninstall
+USAGE
+}
+
+is_running() {
+  if [ -f "$PID_FILE" ]; then
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+require_install() {
+  [ -x "$VENV_PY" ] || { err "missing venv: $VENV_PY"; exit 1; }
+  [ -f "$BOT_PY" ] || { err "missing bot: $BOT_PY"; exit 1; }
+  [ -f "$CFG" ] || { err "missing config: $CFG (copy .example)"; exit 1; }
+}
+
+cfg_enabled() {
+  # Avoid jq dependency; simple grep is fine for our expected JSON.
+  grep -Eq '"enabled"[[:space:]]*:[[:space:]]*true' "$CFG" 2>/dev/null
+}
+
+start() {
+  require_install
+  mkdir -p "$(dirname "$PID_FILE")" "$(dirname "$LOG_OUT")"
+
+  if is_running; then
+    warn "already running (PID: $(cat "$PID_FILE"))"
     exit 0
-fi
+  fi
 
-echo "启动 nanabot..."
-nohup python3 "${INSTALL_DIR}/bin/nanabot.py" > "${INSTALL_DIR}/logs/nanabot.out" 2>&1 &
-sleep 2
+  if ! cfg_enabled; then
+    err "disabled: set enabled=true in $CFG"
+    exit 2
+  fi
 
-if pgrep -f "nanabot.py" > /dev/null; then
-    echo "✓ nanabot 启动成功"
-    echo "查看日志: tail -f ${INSTALL_DIR}/logs/nanabot.log"
-else
-    echo "✗ 启动失败，查看日志: ${INSTALL_DIR}/logs/nanabot.out"
+  info "starting..."
+  nohup "$VENV_PY" "$BOT_PY" >>"$LOG_OUT" 2>&1 &
+  echo $! >"$PID_FILE"
+
+  sleep 1
+  if is_running; then
+    ok "started (PID: $(cat "$PID_FILE"))"
+    info "logs: tail -f $LOG_MAIN"
+  else
+    err "start failed (see $LOG_OUT)"
+    rm -f "$PID_FILE" || true
     exit 1
-fi
-EOF
+  fi
+}
 
-    # 停止脚本
-    cat > "${INSTALL_DIR}/bin/nanabot-stop" << 'EOF'
-#!/bin/bash
-echo "停止 nanabot..."
-pkill -f "nanabot.py" 2>/dev/null || true
-echo "✓ nanabot 已停止"
-EOF
+stop() {
+  if ! is_running; then
+    warn "not running"
+    exit 0
+  fi
 
-    # 状态脚本
-    cat > "${INSTALL_DIR}/bin/nanabot-status" << 'EOF'
-#!/bin/bash
-INSTALL_DIR="${HOME}/nanabot"
+  local pid
+  pid="$(cat "$PID_FILE")"
+  info "stopping (PID: $pid)..."
+  kill "$pid" 2>/dev/null || true
 
-if pgrep -f "nanabot.py" > /dev/null; then
-    echo "✓ nanabot 运行中"
-    echo "PID: $(pgrep -f "nanabot.py")"
-    echo "日志: tail -f ${INSTALL_DIR}/logs/nanabot.log"
-else
-    echo "✗ nanabot 未运行"
-fi
-EOF
+  i=0
+  while [ "$i" -lt 10 ]; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      ok "stopped"
+      rm -f "$PID_FILE" || true
+      exit 0
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
 
-    # 添加执行权限
-    chmod +x "${INSTALL_DIR}/bin/nanabot-"*
-    
-    # 创建全局快捷命令
-    if is_termux; then
-        # Termux 环境
-        if [ -d "$PREFIX/bin" ]; then
-            ln -sf "${INSTALL_DIR}/bin/nanabot-start" "$PREFIX/bin/nanabot-start" 2>/dev/null || true
-            ln -sf "${INSTALL_DIR}/bin/nanabot-stop" "$PREFIX/bin/nanabot-stop" 2>/dev/null || true
-            ln -sf "${INSTALL_DIR}/bin/nanabot-status" "$PREFIX/bin/nanabot-status" 2>/dev/null || true
-        fi
+  warn "force kill..."
+  kill -9 "$pid" 2>/dev/null || true
+  rm -f "$PID_FILE" || true
+  ok "stopped"
+}
+
+restart() {
+  stop || true
+  sleep 1
+  start
+}
+
+status() {
+  if is_running; then
+    ok "running (PID: $(cat "$PID_FILE"))"
+  else
+    warn "stopped"
+  fi
+
+  if [ -f "$CFG" ]; then
+    echo ""
+    echo "Config: $CFG"
+    # Safe summary (never print auth_token).
+    grep -E '"device_id"|"device_name"|"gateway_url"|"enabled"|"metrics_interval"' "$CFG" 2>/dev/null | sed -e 's/^[[:space:]]*//'
+    if grep -Eq '"auth_token"[[:space:]]*:[[:space:]]*null' "$CFG" 2>/dev/null; then
+      echo "auth_token: (null)"
+    elif grep -Eq '"auth_token"[[:space:]]*:[[:space:]]*\"\"' "$CFG" 2>/dev/null; then
+      echo "auth_token: (empty)"
+    elif grep -Eq '"auth_token"[[:space:]]*:' "$CFG" 2>/dev/null; then
+      echo "auth_token: (set)"
     else
-        # 标准 Linux
-        if [ -d "$HOME/.local/bin" ]; then
-            mkdir -p "$HOME/.local/bin"
-            ln -sf "${INSTALL_DIR}/bin/nanabot-start" "$HOME/.local/bin/nanabot-start" 2>/dev/null || true
-            ln -sf "${INSTALL_DIR}/bin/nanabot-stop" "$HOME/.local/bin/nanabot-stop" 2>/dev/null || true
-            ln -sf "${INSTALL_DIR}/bin/nanabot-status" "$HOME/.local/bin/nanabot-status" 2>/dev/null || true
-        fi
+      echo "auth_token: (missing)"
     fi
-    
-    print_success "启动脚本创建完成"
+  fi
+
+  if [ -f "$LOG_MAIN" ]; then
+    echo ""
+    echo "Recent logs:"
+    tail -n 10 "$LOG_MAIN" || true
+  fi
 }
 
-# 创建 Termux 服务
-create_termux_service() {
-    if ! is_termux; then
-        return
+logs() {
+  if [ -f "$LOG_MAIN" ]; then
+    tail -f "$LOG_MAIN"
+  elif [ -f "$LOG_OUT" ]; then
+    tail -f "$LOG_OUT"
+  else
+    err "no logs yet"
+    exit 1
+  fi
+}
+
+config() {
+  ${EDITOR:-nano} "$CFG"
+}
+
+uninstall() {
+  stop || true
+  # Remove global symlinks if they point to this install.
+  if [ -L "$HOME/.local/bin/nanabot" ]; then
+    target="$(readlink "$HOME/.local/bin/nanabot" 2>/dev/null || true)"
+    if [ "$target" = "$NANABOT_DIR/bin/nanabot" ]; then
+      rm -f "$HOME/.local/bin/nanabot" || true
     fi
-    
-    print_info "创建 Termux 后台服务..."
-    
-    mkdir -p "$HOME/.termux/boot"
-    
-    cat > "$HOME/.termux/boot/nanabot" << 'EOF'
-#!/data/data/com.termux/files/usr/bin/sh
-# Termux 开机启动 nanabot
-termux-wake-lock
-$HOME/nanabot/bin/nanabot-start
+  fi
+  if [ -L "/data/data/com.termux/files/usr/bin/nanabot" ]; then
+    target="$(readlink "/data/data/com.termux/files/usr/bin/nanabot" 2>/dev/null || true)"
+    if [ "$target" = "$NANABOT_DIR/bin/nanabot" ]; then
+      rm -f "/data/data/com.termux/files/usr/bin/nanabot" || true
+    fi
+  fi
+  rm -rf "$NANABOT_DIR"
+  ok "removed $NANABOT_DIR"
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  start) start ;;
+  stop) stop ;;
+  restart) restart ;;
+  status) status ;;
+  logs) logs ;;
+  config) config ;;
+  uninstall) uninstall ;;
+  help|--help|-h|"") usage ;;
+  *) err "unknown command: $cmd"; usage; exit 1 ;;
+esac
 EOF
 
-    chmod +x "$HOME/.termux/boot/nanabot"
-    print_success "Termux 开机服务创建完成"
+  chmod +x "${BIN_DIR}/nanabot"
+  step_done 5
 }
 
-# 显示安装信息
-show_info() {
-    echo ""
-    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${GREEN}   nanabot v2.0 安装完成${NC}"
-    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
-    echo -e "安装目录: ${BLUE}${INSTALL_DIR}${NC}"
-    echo -e "配置文件: ${BLUE}${CONFIG_DIR}/nanabot.json${NC}"
-    echo -e "日志文件: ${BLUE}${LOGS_DIR}/nanabot.log${NC}"
-    echo ""
-    echo -e "${YELLOW}⚠️  重要：请先编辑配置文件启用 nanabot${NC}"
-    echo ""
-    echo "步骤 1: 编辑配置"
-    echo -e "   ${BLUE}nano ${CONFIG_DIR}/nanabot.json${NC}"
-    echo ""
-    echo "步骤 2: 修改以下配置"
-    echo '   {'
-    echo '     "enabled": true,          // 启用服务'
-    echo '     "auth_token": "your_token_here"  // 添加认证令牌'
-    echo '   }'
-    echo ""
-    echo "步骤 3: 启动服务"
-    echo -e "   ${BLUE}nanabot-start${NC}"
-    echo ""
-    echo "常用命令:"
-    echo -e "   ${BLUE}nanabot-start${NC}   - 启动服务"
-    echo -e "   ${BLUE}nanabot-stop${NC}    - 停止服务"
-    echo -e "   ${BLUE}nanabot-status${NC}  - 查看状态"
-    echo -e "   ${BLUE}tail -f ${LOGS_DIR}/nanabot.log${NC}  - 查看日志"
-    echo ""
-    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+link_global_cmds() {
+  step_start 6 "Linking commands"
+
+  local target="${BIN_DIR}/nanabot"
+
+  if is_termux; then
+    if [ -n "${PREFIX:-}" ] && [ -d "${PREFIX}/bin" ]; then
+      ln -sf "${target}" "${PREFIX}/bin/nanabot" 2>/dev/null || true
+    elif [ -d "/data/data/com.termux/files/usr/bin" ]; then
+      ln -sf "${target}" "/data/data/com.termux/files/usr/bin/nanabot" 2>/dev/null || true
+    fi
+  else
+    mkdir -p "${HOME}/.local/bin" 2>/dev/null || true
+    if [ -d "${HOME}/.local/bin" ]; then
+      ln -sf "${target}" "${HOME}/.local/bin/nanabot" 2>/dev/null || true
+    fi
+  fi
+
+  step_done 6
 }
 
-# 主安装流程
+setup_termux_boot() {
+  if ! is_termux; then
+    return
+  fi
+
+  step_start 7 "Setting up Termux boot (optional)"
+
+  mkdir -p "${HOME}/.termux/boot" 2>/dev/null || true
+
+  cat > "${HOME}/.termux/boot/nanabot" <<'EOF'
+#!/data/data/com.termux/files/usr/bin/sh
+# Auto-start NanaBot on boot (requires Termux:Boot app).
+#
+# If termux-wake-lock exists (Termux:API), take a wakelock to keep the process alive.
+command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock || true
+
+command -v nanabot >/dev/null 2>&1 && nanabot start || true
+EOF
+
+  chmod +x "${HOME}/.termux/boot/nanabot" || true
+
+  step_done 7
+}
+
+write_marker() {
+  touch "${MARKER_FILE}"
+}
+
+show_post_install() {
+  cat <<EOF
+
+${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}
+${GREEN}  NanaBot installed${NC}
+${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}
+
+Install dir: ${INSTALL_DIR}
+Config:       ${CONFIG_DIR}/nanabot.json
+Logs:         ${LOGS_DIR}/nanabot.log
+
+Next:
+1) Edit config (set enabled=true and auth_token):
+   nano ${CONFIG_DIR}/nanabot.json
+
+2) Start:
+   nanabot start
+
+3) Status/logs:
+   nanabot status
+   nanabot logs
+
+EOF
+}
+
+uninstall() {
+  if [ -x "${BIN_DIR}/nanabot" ]; then
+    "${BIN_DIR}/nanabot" uninstall || true
+  fi
+  rm -rf "${INSTALL_DIR}"
+  log_ok "Uninstalled ${INSTALL_DIR}"
+}
+
+install() {
+  ensure_deps
+  setup_dirs
+  setup_venv
+  write_nanabot_py
+  write_config
+  write_manager
+  link_global_cmds
+  setup_termux_boot
+  write_marker
+  emit_done
+  show_post_install
+}
+
 main() {
-    echo -e "${BLUE}"
-    echo "┌─────────────────────────────────────────┐"
-    echo "│      nanabot v2.0 安装程序              │"
-    echo "│      Oyster Republic Edge Agent         │"
-    echo "└─────────────────────────────────────────┘"
-    echo -e "${NC}"
-    
-    print_info "开始安装..."
-    
-    check_dependencies
-    setup_directories
-    setup_venv
-    create_main_program
-    create_config
-    create_launcher_scripts
-    create_termux_service
-    
-    show_info
-    
-    print_success "安装完成！"
+  local cmd="${1:-install}"
+  case "${cmd}" in
+    install) install ;;
+    uninstall) uninstall ;;
+    *) install ;; # default behavior for curl|bash usage
+  esac
 }
 
-# 运行安装
-main "$@"
+main "${1:-}"
